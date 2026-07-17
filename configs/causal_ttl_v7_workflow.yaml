@@ -1,0 +1,62 @@
+{
+  "experiment": {
+    "name": "causal_ttl_v7_local_workflow",
+    "seed": 17,
+    "output_dir": "outputs/causal_ttl_v7_local_workflow"
+  },
+  "data": {
+    "train_dataset": "data/processed/qa_test/train.json",
+    "eval_dataset": "data/processed/qa_test/test.json"
+  },
+  "teacher": {
+    "backend": "heuristic",
+    "cache_dir": "outputs/teacher_cache"
+  },
+  "frontdoor": {
+    "enabled": true,
+    "num_reasoning_paths": 8,
+    "cluster_similarity_threshold": 0.45,
+    "max_clusters": 4,
+    "causal_margin": 0.15,
+    "min_feedback_gain": 0.05,
+    "answer_weight_floor": 1.0,
+    "answer_weight_scale": 1.0,
+    "counterfactual_weight_scale": 1.0,
+    "policy_weight_scale": 1.0,
+    "max_sample_weight": 4.0,
+    "seed": 17
+  },
+  "supervision": {
+    "mode": "v7",
+    "cloud_budget_ratio": 1.0
+  },
+  "training": {
+    "model_name_or_path": "Qwen/Qwen2.5-7B-Instruct",
+    "task_types": ["answer", "counterfactual", "policy"],
+    "max_length": 2048,
+    "learning_rate": 5.0e-5,
+    "num_train_epochs": 1.0,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "finetuning_type": "lora",
+    "lora_target": "q_proj,v_proj",
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.05,
+    "answer_loss_weight": 1.0,
+    "counterfactual_loss_weight": 1.0,
+    "policy_loss_weight": 1.0,
+    "use_sample_weight": true,
+    "normalize_weighted_loss": true,
+    "logging_steps": 10,
+    "save_steps": 100
+  },
+  "inference": {
+    "mode": "v7",
+    "knowledge_at_inference": false,
+    "max_new_tokens": 512,
+    "chunk_size": 64,
+    "max_cloud_calls": 3,
+    "cloud_budget_ratio": 1.0
+  }
+}
