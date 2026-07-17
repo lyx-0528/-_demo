@@ -1,0 +1,25 @@
+{
+  "experiment": {
+    "name": "digestive_mock_dry_run",
+    "seed": 17,
+    "output_dir": "outputs/digestive_mock_dry_run"
+  },
+  "data": {
+    "dataset_path": "../MedThink/PrecisionBoost/data/digestive_Qwen2_72b_Instruction_test.json",
+    "limit": 50
+  },
+  "baseline": {
+    "name": "causal_ttl_mock"
+  },
+  "pipeline": {
+    "num_reasoning_paths": 10,
+    "cluster_similarity_threshold": 0.42,
+    "max_clusters": 4,
+    "causal_margin": 0.15,
+    "min_feedback_gain": 0.05
+  },
+  "runtime": {
+    "write_predictions_json": true,
+    "write_predictions_csv": true
+  }
+}

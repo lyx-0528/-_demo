@@ -1,0 +1,9 @@
+pandas>=2.2
+transformers>=4.44
+accelerate>=0.33
+datasets>=2.21
+peft>=0.12
+bitsandbytes>=0.43
+sentencepiece>=0.2
+scipy>=1.14
+tqdm>=4.66
