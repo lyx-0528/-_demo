@@ -94,7 +94,7 @@ CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = (
     'Each step must be an object with keys: goal, causal, needs_knowledge, action, query.\n'
     'Allowed action values: "LOCAL_REASON", "ASK_CLOUD", "ANSWER".\n'
     "Preserve only information supported by the draft. If a field is missing, use [] or \"\". "
-    "Do not include markdown fences or explanations."
+    "Do not include markdown fences or explanations. Return only valid JSON."
 )
 
 ARITHMETIC_CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = (
@@ -105,7 +105,7 @@ ARITHMETIC_CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = (
     f'In causal fields, keep {KNOWLEDGE_TOKEN} placeholders when the draft describes intermediate values abstractly.\n'
     "Facts should contain concrete intermediate numeric results in step order. "
     "If the draft does not support a field, use [] or \"\". "
-    "Do not include markdown fences or explanations."
+    "Do not include markdown fences or explanations. Return only valid JSON."
 )
 
 _ARITHMETIC_HINT_RE = re.compile(
