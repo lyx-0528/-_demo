@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import inspect
 import json
 from statistics import mean
 from typing import Any, Optional
@@ -111,14 +112,22 @@ def train_on_supervision_records(
     )
 
     trainer_cls = build_weighted_trainer_class()
+    trainer_kwargs = {
+        "runtime_config": config,
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+        "eval_dataset": eval_dataset,
+        "data_collator": data_collator,
+    }
+    trainer_signature = inspect.signature(trainer_cls.__init__)
+    if "processing_class" in trainer_signature.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in trainer_signature.parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+
     trainer = trainer_cls(
-        runtime_config=config,
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
+        **trainer_kwargs,
     )
     train_result = trainer.train()
     trainer.save_model()

@@ -88,6 +88,26 @@ KNOWLEDGE_FILL_SYSTEM_PROMPT = (
     "One or two concise sentences. No JSON."
 )
 
+CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = (
+    "You are a strict JSON normalizer. Convert the provided DRAFT into a SINGLE valid JSON object and nothing else. "
+    "Use exactly these keys: causal_factors, confounders, steps, facts, counterfactuals, answer.\n"
+    'Each step must be an object with keys: goal, causal, needs_knowledge, action, query.\n'
+    'Allowed action values: "LOCAL_REASON", "ASK_CLOUD", "ANSWER".\n'
+    "Preserve only information supported by the draft. If a field is missing, use [] or \"\". "
+    "Do not include markdown fences or explanations."
+)
+
+ARITHMETIC_CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = (
+    "You are a strict JSON normalizer for arithmetic/GSM8K drafts. Convert the provided DRAFT into a SINGLE valid JSON object and nothing else.\n"
+    "Use exactly these keys: causal_factors, confounders, steps, facts, counterfactuals, answer.\n"
+    'Each step must be an object with keys: goal, causal, needs_knowledge, action, query.\n'
+    'Allowed action values: "LOCAL_REASON", "ASK_CLOUD", "ANSWER".\n'
+    f'In causal fields, keep {KNOWLEDGE_TOKEN} placeholders when the draft describes intermediate values abstractly.\n'
+    "Facts should contain concrete intermediate numeric results in step order. "
+    "If the draft does not support a field, use [] or \"\". "
+    "Do not include markdown fences or explanations."
+)
+
 _ARITHMETIC_HINT_RE = re.compile(
     r"\b("
     r"how many|how much|total|left|remain|remaining|change|cost|price|each|per|every|"
@@ -253,6 +273,20 @@ def build_causal_teacher_user_prompt(question: str) -> str:
     )
 
 
+def select_causal_repair_system_prompt(question: str) -> str:
+    return ARITHMETIC_CAUSAL_JSON_REPAIR_SYSTEM_PROMPT if looks_like_arithmetic_question(question) else CAUSAL_JSON_REPAIR_SYSTEM_PROMPT
+
+
+def build_causal_repair_user_prompt(question: str, draft_response: str) -> str:
+    return (
+        f"QUESTION:\n{(question or '').strip()}\n\n"
+        "DRAFT RESPONSE TO NORMALIZE:\n"
+        f"{(draft_response or '').strip()}\n\n"
+        "Convert the draft into exactly one valid JSON object with keys "
+        "causal_factors, confounders, steps, facts, counterfactuals, answer."
+    )
+
+
 def _coerce_str_list(value: Any) -> list[str]:
     if isinstance(value, str):
         value = [value]
@@ -412,32 +446,43 @@ def _recover_structured_fields(text: str) -> dict[str, Any]:
     }
 
 
+def score_causal_payload(candidate: dict[str, Any]) -> tuple[int, int]:
+    steps = candidate.get("steps")
+    facts = candidate.get("facts")
+    counterfactuals = candidate.get("counterfactuals")
+    causal_factors = candidate.get("causal_factors")
+    confounders = candidate.get("confounders")
+    answer = str(candidate.get("answer", "") or "").strip()
+
+    score = 0
+    if isinstance(steps, list) and steps:
+        score += 5
+    if isinstance(facts, list) and facts:
+        score += 4
+    if isinstance(counterfactuals, list) and counterfactuals:
+        score += 3
+    if isinstance(causal_factors, list) and causal_factors:
+        score += 2
+    if isinstance(confounders, list) and confounders:
+        score += 1
+    if answer:
+        score += 2
+    return score, len(json.dumps(candidate, ensure_ascii=False))
+
+
+def needs_causal_payload_repair(payload: dict[str, Any]) -> bool:
+    if not str(payload.get("answer", "") or "").strip():
+        return True
+    if not payload.get("steps"):
+        return True
+    if not payload.get("facts"):
+        return True
+    return False
+
+
 def parse_causal_payload(text: str, *, _allow_nested: bool = True) -> dict[str, Any]:
     raw = text.strip()
     payload: Optional[dict[str, Any]] = None
-
-    def _score_payload(candidate: dict[str, Any]) -> tuple[int, int]:
-        steps = candidate.get("steps")
-        facts = candidate.get("facts")
-        counterfactuals = candidate.get("counterfactuals")
-        causal_factors = candidate.get("causal_factors")
-        confounders = candidate.get("confounders")
-        answer = str(candidate.get("answer", "") or "").strip()
-
-        score = 0
-        if isinstance(steps, list) and steps:
-            score += 5
-        if isinstance(facts, list) and facts:
-            score += 4
-        if isinstance(counterfactuals, list) and counterfactuals:
-            score += 3
-        if isinstance(causal_factors, list) and causal_factors:
-            score += 2
-        if isinstance(confounders, list) and confounders:
-            score += 1
-        if answer:
-            score += 2
-        return score, len(json.dumps(candidate, ensure_ascii=False))
 
     best_payload: Optional[dict[str, Any]] = None
     best_score: Optional[tuple[int, int]] = None
@@ -450,7 +495,7 @@ def parse_causal_payload(text: str, *, _allow_nested: bool = True) -> dict[str, 
         except (json.JSONDecodeError, TypeError):
             continue
         if isinstance(parsed, dict):
-            score = _score_payload(parsed)
+            score = score_causal_payload(parsed)
             if best_payload is None or score > best_score:
                 best_payload = parsed
                 best_score = score
