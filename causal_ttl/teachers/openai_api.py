@@ -54,6 +54,8 @@ class OpenAICompatibleTeacher(BaseTeacher):
             "temperature": self.temperature,
             "max_tokens": self.max_new_tokens,
         }
+        if system_prompt and "Return only valid JSON" in system_prompt:
+            payload["response_format"] = {"type": "json_object"}
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
