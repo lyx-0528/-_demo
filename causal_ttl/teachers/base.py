@@ -7,8 +7,12 @@ from ..knowledge_tokens import KNOWLEDGE_TOKEN
 from ..schema import MedSample
 from .parsing import (
     KNOWLEDGE_FILL_SYSTEM_PROMPT,
+    build_causal_repair_user_prompt,
     build_causal_teacher_user_prompt,
+    needs_causal_payload_repair,
     parse_causal_payload,
+    score_causal_payload,
+    select_causal_repair_system_prompt,
     select_causal_teacher_system_prompt,
 )
 
@@ -24,7 +28,20 @@ class BaseTeacher(ABC):
     def generate_causal(self, prompt: str) -> dict[str, Any]:
         teacher_prompt = build_causal_teacher_user_prompt(prompt)
         system_prompt = select_causal_teacher_system_prompt(prompt)
-        return parse_causal_payload(self.generate(teacher_prompt, system_prompt=system_prompt))
+        raw_response = self.generate(teacher_prompt, system_prompt=system_prompt)
+        payload = parse_causal_payload(raw_response)
+
+        if not needs_causal_payload_repair(payload):
+            return payload
+
+        repair_prompt = build_causal_repair_user_prompt(prompt, raw_response)
+        repair_system_prompt = select_causal_repair_system_prompt(prompt)
+        repaired_response = self.generate(repair_prompt, system_prompt=repair_system_prompt)
+        repaired_payload = parse_causal_payload(repaired_response)
+
+        if score_causal_payload(repaired_payload) > score_causal_payload(payload):
+            return repaired_payload
+        return payload
 
     def generate_causal_batch(self, prompts: list[str]) -> list[dict[str, Any]]:
         return [self.generate_causal(prompt) for prompt in prompts]
