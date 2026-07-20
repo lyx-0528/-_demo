@@ -130,6 +130,8 @@ _STEP_LINE_RE = re.compile(
     r'action\s*:\s*(?P<action>LOCAL_REASON|ASK_CLOUD|ANSWER)\s*,\s*'
     r'query\s*:\s*"?(?P<query>[^"\n]*)"?\s*$'
 )
+_ARITHMETIC_PROSE_STEP_RE = re.compile(r"(?im)^\s*(?:step\s*)?(?P<idx>\d+)[\.\):]\s*(?P<body>.+)$")
+_ARITHMETIC_RESULT_RE = re.compile(r"=\s*(?P<value>-?\$?\d+(?:\.\d+)?)")
 
 
 def _extract_json_block(text: str) -> Optional[str]:
@@ -446,6 +448,98 @@ def _recover_structured_fields(text: str) -> dict[str, Any]:
     }
 
 
+def _extract_arithmetic_step_result(body: str) -> str:
+    matches = [match.group("value").strip() for match in _ARITHMETIC_RESULT_RE.finditer(body or "")]
+    if matches:
+        return matches[-1]
+    numeric_values = [value.strip() for value in _NUMERIC_VALUE_RE.findall(body or "")]
+    return numeric_values[-1] if numeric_values else ""
+
+
+def _extract_arithmetic_step_expression(body: str) -> str:
+    text = (body or "").strip()
+    if "=" not in text:
+        return ""
+    parts = text.split("=")
+    if len(parts) < 2:
+        return ""
+    candidate = parts[-2].strip()
+    if ":" in candidate:
+        candidate = candidate.split(":", 1)[-1].strip()
+    candidate = re.sub(r"\s+", " ", candidate).strip(" .")
+    return candidate
+
+
+def _build_arithmetic_step_goal(body: str, index: int) -> str:
+    text = (body or "").strip()
+    if ":" in text:
+        goal = text.split(":", 1)[0].strip()
+        if goal:
+            return goal
+    return f"compute arithmetic step {index}"
+
+
+def _build_arithmetic_step_causal(goal: str, is_final_step: bool) -> str:
+    if is_final_step:
+        return "Use the previously computed quantities to produce the final answer."
+    goal_text = (goal or "the required intermediate quantity").strip().rstrip(".")
+    goal_text = goal_text[0].lower() + goal_text[1:] if goal_text else "the required intermediate quantity"
+    return f"Compute {goal_text} to obtain {KNOWLEDGE_TOKEN}."
+
+
+def _build_arithmetic_step_query(body: str, fallback_goal: str) -> str:
+    expression = _extract_arithmetic_step_expression(body)
+    if expression:
+        return f"What is {expression}?"
+    fallback = (fallback_goal or "the required arithmetic quantity").strip().rstrip(".")
+    return f"What is the result of {fallback}?"
+
+
+def _recover_arithmetic_fields(text: str) -> dict[str, Any]:
+    raw = text or ""
+    if not looks_like_arithmetic_question(raw):
+        return {"steps": [], "facts": [], "answer": ""}
+
+    matches = list(_ARITHMETIC_PROSE_STEP_RE.finditer(raw))
+    if not matches:
+        return {"steps": [], "facts": [], "answer": ""}
+
+    steps: list[dict[str, Any]] = []
+    facts: list[str] = []
+    answer = ""
+
+    for position, match in enumerate(matches, start=1):
+        body = (match.group("body") or "").strip()
+        if not body:
+            continue
+
+        is_final_step = position == len(matches)
+        goal = _build_arithmetic_step_goal(body, position)
+        result_value = _extract_arithmetic_step_result(body)
+        action = "ANSWER" if is_final_step else "ASK_CLOUD"
+        step = {
+            "goal": goal,
+            "causal": _build_arithmetic_step_causal(goal, is_final_step),
+            "needs_knowledge": not is_final_step,
+            "action": action,
+            "query": "" if is_final_step else _build_arithmetic_step_query(body, goal),
+        }
+        steps.append(step)
+
+        if is_final_step:
+            if result_value:
+                answer = result_value
+        elif result_value:
+            facts.append(result_value)
+
+    if not answer:
+        answer = _extract_answer_from_text(raw)
+    if not answer and facts:
+        answer = facts[-1]
+
+    return {"steps": steps, "facts": facts, "answer": answer}
+
+
 def score_causal_payload(candidate: dict[str, Any]) -> tuple[int, int]:
     steps = candidate.get("steps")
     facts = candidate.get("facts")
@@ -516,6 +610,12 @@ def parse_causal_payload(text: str, *, _allow_nested: bool = True) -> dict[str, 
         for key in ("steps", "facts", "causal_factors", "confounders", "counterfactuals"):
             if recovered.get(key):
                 result[key] = recovered[key]
+        arithmetic_recovered = _recover_arithmetic_fields(raw)
+        for key in ("steps", "facts"):
+            if arithmetic_recovered.get(key) and not result.get(key):
+                result[key] = arithmetic_recovered[key]
+        if arithmetic_recovered.get("answer") and not result["answer"]:
+            result["answer"] = arithmetic_recovered["answer"]
         return result
 
     raw_chain = payload.get("causal_chain", "")
@@ -580,5 +680,11 @@ def parse_causal_payload(text: str, *, _allow_nested: bool = True) -> dict[str, 
         for key in ("steps", "facts", "causal_factors", "confounders", "counterfactuals"):
             if recovered.get(key) and not result.get(key):
                 result[key] = recovered[key]
+        arithmetic_recovered = _recover_arithmetic_fields(source_text)
+        for key in ("steps", "facts"):
+            if arithmetic_recovered.get(key) and not result.get(key):
+                result[key] = arithmetic_recovered[key]
+        if arithmetic_recovered.get("answer") and not result["answer"]:
+            result["answer"] = arithmetic_recovered["answer"]
 
     return result
