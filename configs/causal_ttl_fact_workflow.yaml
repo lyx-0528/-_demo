@@ -9,7 +9,7 @@
     "eval_dataset": "data/processed/qa_test/test.json"
   },
   "teacher": {
-    "backend": "heuristic",
+    "backend": "api",
     "cache_dir": "outputs/teacher_cache"
   },
   "frontdoor": {

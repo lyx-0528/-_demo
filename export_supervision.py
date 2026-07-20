@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--teacher-backend",
         choices=("heuristic", "api"),
-        default="heuristic",
+        default="api",
         help="Teacher backend. Use `heuristic` for local dry runs or `api` for a real teacher.",
     )
     parser.add_argument("--teacher-api-base", default=None, help="Override TEACHER_API_BASE for the API backend.")
@@ -70,7 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    samples = load_samples_auto(args.dataset, limit=args.limit)
+    dataset_path = args.dataset.resolve()
+    output_dir = args.output_dir.resolve()
+    teacher_cache_dir = args.teacher_cache_dir.resolve()
+
+    samples = load_samples_auto(dataset_path, limit=args.limit)
     teacher = build_teacher(
         args.teacher_backend,
         api_base=args.teacher_api_base,
@@ -78,7 +82,7 @@ def main() -> None:
         model=args.teacher_model,
         temperature=args.teacher_temperature,
         max_new_tokens=args.teacher_max_new_tokens,
-        cache_dir=str(args.teacher_cache_dir),
+        cache_dir=str(teacher_cache_dir),
     )
     frontdoor = FrontDoorConfig(
         enabled=args.enable_frontdoor,
@@ -95,11 +99,11 @@ def main() -> None:
         seed=args.frontdoor_seed,
     )
     config = config_from_mode(args.mode, cloud_budget_ratio=args.cloud_budget_ratio, frontdoor=frontdoor)
-    summary = export_supervision_dataset(samples, teacher, args.output_dir.resolve(), config)
+    summary = export_supervision_dataset(samples, teacher, output_dir, config)
 
     report = {
-        "dataset": str(args.dataset.resolve()),
-        "output_dir": str(args.output_dir.resolve()),
+        "dataset": str(dataset_path),
+        "output_dir": str(output_dir),
         "teacher_backend": args.teacher_backend,
         "mode": args.mode,
         "summary": summary,

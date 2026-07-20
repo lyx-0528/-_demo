@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--max-cloud-calls", type=int, default=3)
     parser.add_argument("--cloud-budget-ratio", type=float, default=1.0)
-    parser.add_argument("--teacher-backend", choices=("heuristic", "api"), default="heuristic")
+    parser.add_argument("--teacher-backend", choices=("heuristic", "api"), default="api")
     parser.add_argument("--teacher-api-base", default=None)
     parser.add_argument("--teacher-api-key", default=None)
     parser.add_argument("--teacher-model", default=None)

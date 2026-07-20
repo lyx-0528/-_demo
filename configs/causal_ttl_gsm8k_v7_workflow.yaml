@@ -1,12 +1,12 @@
 {
   "experiment": {
-    "name": "causal_ttl_v7_local_workflow",
+    "name": "causal_ttl_gsm8k_v7_workflow",
     "seed": 17,
-    "output_dir": "outputs/causal_ttl_v7_local_workflow"
+    "output_dir": "outputs/causal_ttl_gsm8k_v7_workflow"
   },
   "data": {
-    "train_dataset": "data/processed/qa_test/train.json",
-    "eval_dataset": "data/processed/qa_test/test.json"
+    "train_dataset": "data/processed/gsm8k_500/train.json",
+    "eval_dataset": "data/processed/gsm8k_500/test.json"
   },
   "teacher": {
     "backend": "api",

@@ -3,17 +3,27 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+import re
 
 from .schema import MedSample
 
 
-ANSWER_PREFIXES = ("答案：", "答案:", "answer:", "answer：")
+ANSWER_PREFIXES = (
+    "\u7b54\u6848\uff1a",
+    "\u7b54\u6848:",
+    "answer:",
+    "answer\uff1a",
+)
 KNOWLEDGE_MARKERS = (
-    "需要的医学知识包括",
-    "以下是",
-    "解决这个问题需要",
-    "这题涉及到",
-    "医学知识",
+    "\u9700\u8981\u7684\u533b\u5b66\u77e5\u8bc6\u5305\u62ec",
+    "\u4ee5\u4e0b\u662f",
+    "\u89e3\u51b3\u8fd9\u4e2a\u95ee\u9898\u9700\u8981",
+    "\u8fd9\u9898\u6d89\u53ca\u5230",
+    "\u533b\u5b66\u77e5\u8bc6",
+)
+INSTRUCTION_BLOCK_RE = re.compile(
+    r"###\s*Instruction:\s*(.*?)(?:\n\s*###\s*Response:|\Z)",
+    flags=re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -22,9 +32,9 @@ def _trim_answer(answer_text: str) -> str:
         line = line.strip()
         if not line:
             continue
-        if line[0].isdigit() and "." in line[:3]:
+        if re.match(r"^\d+\.", line):
             continue
-        return line.strip("：:;；。 ")
+        return line.strip(" :;,.!?")
     return answer_text.strip()
 
 
@@ -37,8 +47,9 @@ def _split_instruction_answer(assistant_text: str) -> tuple[str, str]:
         if prefix in content:
             extracted = content.split(prefix, 1)[1].strip()
             break
-        if prefix in lower_content:
-            start = lower_content.index(prefix)
+        lower_prefix = prefix.lower()
+        if lower_prefix in lower_content:
+            start = lower_content.index(lower_prefix)
             extracted = content[start + len(prefix) :].strip()
             break
 
@@ -54,14 +65,26 @@ def _split_instruction_answer(assistant_text: str) -> tuple[str, str]:
     return _trim_answer(chunks[0] if chunks else extracted), knowledge
 
 
+def _extract_instruction_prompt(instruction_text: str, input_text: str = "") -> str:
+    prompt = instruction_text.strip()
+    match = INSTRUCTION_BLOCK_RE.search(prompt)
+    if match:
+        prompt = match.group(1).strip()
+
+    input_text = input_text.strip()
+    if input_text:
+        prompt = f"{prompt}\n\n{input_text}"
+    return prompt.strip()
+
+
 def load_medthink_csv(path: Path, limit: int | None = None) -> list[MedSample]:
     samples: list[MedSample] = []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         for index, row in enumerate(reader):
-            question = (row.get("question") or "").strip()
-            answer = (row.get("answer") or "").strip()
-            knowledge = (row.get("knowledge") or "").strip()
+            question = str(row.get("question") or "").strip()
+            answer = str(row.get("answer") or "").strip()
+            knowledge = str(row.get("knowledge") or "").strip()
             if not question or not answer:
                 continue
             samples.append(
@@ -80,23 +103,39 @@ def load_medthink_csv(path: Path, limit: int | None = None) -> list[MedSample]:
 
 def load_instruction_json(path: Path, limit: int | None = None) -> list[MedSample]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Instruction dataset {path} must be a JSON array.")
+
     samples: list[MedSample] = []
     for index, entry in enumerate(payload):
-        conversations = entry.get("conversations", [])
-        if len(conversations) < 2:
+        if not isinstance(entry, dict):
             continue
-        question = conversations[0].get("value", "").strip()
-        assistant_text = conversations[1].get("value", "").strip()
-        answer, knowledge = _split_instruction_answer(assistant_text)
+
+        sample_id = str(entry.get("id") or f"{path.stem}-{index}")
+        knowledge = str(entry.get("knowledge") or "").strip()
+        question = ""
+        assistant_text = ""
+
+        conversations = entry.get("conversations", [])
+        if isinstance(conversations, list) and len(conversations) >= 2:
+            question = str(conversations[0].get("value") or "").strip()
+            assistant_text = str(conversations[1].get("value") or "").strip()
+        else:
+            instruction_text = str(entry.get("instruction") or "").strip()
+            input_text = str(entry.get("input") or "").strip()
+            assistant_text = str(entry.get("output") or "").strip()
+            question = _extract_instruction_prompt(instruction_text, input_text)
+
+        answer, parsed_knowledge = _split_instruction_answer(assistant_text)
         if not question or not answer:
             continue
-        sample_id = entry.get("id") or f"{path.stem}-{index}"
+
         samples.append(
             MedSample(
                 sample_id=sample_id,
                 question=question,
                 gold_answer=answer,
-                knowledge=knowledge,
+                knowledge=knowledge or parsed_knowledge,
                 source=path.name,
             )
         )
@@ -155,7 +194,10 @@ def load_samples_auto(path: Path, limit: int | None = None) -> list[MedSample]:
         return load_medthink_csv(path, limit=limit)
     if suffix == ".json":
         try:
-            return load_prepared_json(path, limit=limit)
+            prepared_samples = load_prepared_json(path, limit=limit)
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-            return load_instruction_json(path, limit=limit)
+            prepared_samples = []
+        if prepared_samples:
+            return prepared_samples
+        return load_instruction_json(path, limit=limit)
     raise ValueError(f"Unsupported dataset format: {path}")

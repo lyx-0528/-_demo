@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 from .base import BaseTeacher
 from .heuristic import HeuristicCausalTeacher
 from .openai_api import OpenAICompatibleTeacher
+
+
+def _load_local_env_file() -> None:
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
 
 
 def build_teacher(
@@ -18,6 +40,7 @@ def build_teacher(
     max_new_tokens: int = 512,
     cache_dir: Optional[str] = None,
 ) -> BaseTeacher:
+    _load_local_env_file()
     normalized_backend = backend.strip().lower()
     if normalized_backend == "heuristic":
         return HeuristicCausalTeacher(cache_dir=cache_dir)
