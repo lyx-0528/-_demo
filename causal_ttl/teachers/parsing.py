@@ -148,6 +148,47 @@ def _extract_balanced_json_block(text: str) -> Optional[str]:
     return None
 
 
+def _extract_all_balanced_json_blocks(text: str) -> list[str]:
+    raw = text or ""
+    blocks: list[str] = []
+    start: Optional[int] = None
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index, char in enumerate(raw):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+            continue
+
+        if char == "}":
+            if depth <= 0:
+                continue
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = raw[start : index + 1].strip()
+                if candidate:
+                    blocks.append(candidate)
+                start = None
+
+    return blocks
+
+
 def _extract_json_candidates(text: str) -> list[str]:
     raw = text.strip()
     candidates: list[str] = []
@@ -160,6 +201,8 @@ def _extract_json_candidates(text: str) -> list[str]:
     _append(raw)
     for match in _JSON_FENCE_RE.finditer(raw):
         _append(match.group(1))
+    for candidate in reversed(_extract_all_balanced_json_blocks(raw)):
+        _append(candidate)
     _append(_extract_balanced_json_block(raw))
     _append(_extract_json_block(raw))
     return candidates
@@ -373,6 +416,32 @@ def parse_causal_payload(text: str, *, _allow_nested: bool = True) -> dict[str, 
     raw = text.strip()
     payload: Optional[dict[str, Any]] = None
 
+    def _score_payload(candidate: dict[str, Any]) -> tuple[int, int]:
+        steps = candidate.get("steps")
+        facts = candidate.get("facts")
+        counterfactuals = candidate.get("counterfactuals")
+        causal_factors = candidate.get("causal_factors")
+        confounders = candidate.get("confounders")
+        answer = str(candidate.get("answer", "") or "").strip()
+
+        score = 0
+        if isinstance(steps, list) and steps:
+            score += 5
+        if isinstance(facts, list) and facts:
+            score += 4
+        if isinstance(counterfactuals, list) and counterfactuals:
+            score += 3
+        if isinstance(causal_factors, list) and causal_factors:
+            score += 2
+        if isinstance(confounders, list) and confounders:
+            score += 1
+        if answer:
+            score += 2
+        return score, len(json.dumps(candidate, ensure_ascii=False))
+
+    best_payload: Optional[dict[str, Any]] = None
+    best_score: Optional[tuple[int, int]] = None
+
     for candidate in _extract_json_candidates(raw):
         if not candidate:
             continue
@@ -381,8 +450,12 @@ def parse_causal_payload(text: str, *, _allow_nested: bool = True) -> dict[str, 
         except (json.JSONDecodeError, TypeError):
             continue
         if isinstance(parsed, dict):
-            payload = parsed
-            break
+            score = _score_payload(parsed)
+            if best_payload is None or score > best_score:
+                best_payload = parsed
+                best_score = score
+
+    payload = best_payload
 
     if payload is None:
         result = {

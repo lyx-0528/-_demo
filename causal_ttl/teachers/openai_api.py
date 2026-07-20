@@ -42,6 +42,45 @@ class OpenAICompatibleTeacher(BaseTeacher):
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
+    @staticmethod
+    def _extract_complete_json_object(text: str) -> Optional[str]:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+
+        for start, char in enumerate(raw):
+            if char != "{":
+                continue
+            depth = 0
+            in_string = False
+            escaped = False
+            for index in range(start, len(raw)):
+                current = raw[index]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif current == "\\":
+                        escaped = True
+                    elif current == '"':
+                        in_string = False
+                    continue
+
+                if current == '"':
+                    in_string = True
+                    continue
+                if current == "{":
+                    depth += 1
+                elif current == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start : index + 1].strip()
+                        try:
+                            json.loads(candidate)
+                        except (json.JSONDecodeError, TypeError):
+                            break
+                        return candidate
+        return None
+
     def _request(self, prompt: str, system_prompt: Optional[str]) -> str:
         url = f"{self.api_base}/chat/completions"
         messages = []
@@ -75,6 +114,22 @@ class OpenAICompatibleTeacher(BaseTeacher):
         message = choices[0].get("message") or {}
         content = message.get("content") if isinstance(message.get("content"), str) else ""
         reasoning = message.get("reasoning_content") if isinstance(message.get("reasoning_content"), str) else ""
+        expects_json = bool(system_prompt and "Return only valid JSON" in system_prompt)
+
+        if expects_json:
+            content_json = self._extract_complete_json_object(content)
+            if content_json:
+                return content_json
+
+            reasoning_json = self._extract_complete_json_object(reasoning)
+            if reasoning_json:
+                return reasoning_json
+
+            if content.strip():
+                return content.strip()
+            if reasoning.strip():
+                return reasoning.strip()
+
         text = content.strip()
         if not text and reasoning.strip():
             text = reasoning.strip()
