@@ -116,6 +116,7 @@ _DIGIT_RE = re.compile(r"\d")
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", flags=re.DOTALL | re.IGNORECASE)
 _SCHEMA_ANCHOR_RE = re.compile(r'"(?:causal_factors|confounders|steps|facts|counterfactuals|answer)"')
 _NUMERIC_VALUE_RE = re.compile(r"(?<![\w/])-?\$?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?")
+_NUMERIC_TOKEN_FULL_RE = re.compile(r"^-?\$?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?$")
 _SECTION_LABEL_RE = re.compile(r"(?P<label>Causal factors|Confounders|Counterfactuals|Facts|Answer|Steps)\s*:")
 _SECTION_LABEL_LINE_RE = re.compile(
     r"(?im)(?:^|\n)\s*(?P<label>causal factors|confounders|counterfactuals|facts|answer|steps)\s*:"
@@ -129,6 +130,15 @@ _STEP_LINE_RE = re.compile(
 )
 _ARITHMETIC_PROSE_STEP_RE = re.compile(r"(?im)^\s*(?:step\s*)?(?P<idx>\d+)[\.\):]\s*(?P<body>.+)$")
 _ARITHMETIC_RESULT_RE = re.compile(r"=\s*(?P<value>-?\$?\d+(?:\.\d+)?)")
+_SUSPICIOUS_QUERY_RE = re.compile(
+    r'(?i)(?:\bgoal\b\s*:|\bcausal\b\s*:|\bneeds_knowledge\b\s*:|\baction\b\s*:|\bquery\b\s*:|schema contract|return exactly one json object|first character of your reply|\{|\})'
+)
+_SUSPICIOUS_ANSWER_RE = re.compile(
+    r"(?i)\b(?:step|result|need|produce|json|schema|query|goal|reply|character)\b"
+)
+_REASONING_LEAK_RE = re.compile(
+    r"(?i)\b(?:we need to|let'?s|json:|schema contract|return exactly one json object|the first character of your reply)\b"
+)
 
 
 def _extract_json_block(text: str) -> Optional[str]:
@@ -642,6 +652,12 @@ def _count_ask_cloud_steps(steps: Any) -> int:
     return sum(1 for step in steps if isinstance(step, dict) and str(step.get("action", "")).upper() == "ASK_CLOUD")
 
 
+def _count_answer_steps(steps: Any) -> int:
+    if not isinstance(steps, list):
+        return 0
+    return sum(1 for step in steps if isinstance(step, dict) and str(step.get("action", "")).upper() == "ANSWER")
+
+
 def _step_is_complete(step: Any) -> bool:
     if not isinstance(step, dict):
         return False
@@ -653,6 +669,105 @@ def _step_is_complete(step: Any) -> bool:
     if action == "ANSWER":
         return bool(step.get("goal") or step.get("causal"))
     return bool(step.get("causal"))
+
+
+def _payload_text(payload: dict[str, Any]) -> str:
+    segments: list[str] = []
+    for key in ("causal_chain", "answer"):
+        value = payload.get(key, "")
+        if isinstance(value, str) and value.strip():
+            segments.append(value.strip())
+
+    for key in ("facts", "causal_factors", "confounders"):
+        value = payload.get(key, [])
+        if isinstance(value, list):
+            segments.extend(str(item).strip() for item in value if str(item).strip())
+
+    steps = payload.get("steps", [])
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            for key in ("goal", "causal", "query"):
+                value = str(step.get(key, "") or "").strip()
+                if value:
+                    segments.append(value)
+
+    return "\n".join(segments)
+
+
+def _payload_looks_arithmetic(payload: dict[str, Any]) -> bool:
+    text = _payload_text(payload)
+    if looks_like_arithmetic_question(text):
+        return True
+    facts = payload.get("facts", [])
+    if isinstance(facts, list) and any(_NUMERIC_VALUE_RE.fullmatch(str(item).strip()) for item in facts if str(item).strip()):
+        return True
+    answer = str(payload.get("answer", "") or "").strip()
+    return bool(answer and _NUMERIC_VALUE_RE.fullmatch(answer))
+
+
+def _is_numeric_answer(answer: str) -> bool:
+    return bool(_NUMERIC_TOKEN_FULL_RE.fullmatch((answer or "").strip()))
+
+
+def _facts_are_numeric(facts: Any) -> bool:
+    if not isinstance(facts, list):
+        return False
+    cleaned = [str(item).strip() for item in facts if str(item).strip()]
+    if not cleaned:
+        return True
+    return all(_NUMERIC_TOKEN_FULL_RE.fullmatch(item) for item in cleaned)
+
+
+def _step_has_suspicious_query(step: Any) -> bool:
+    if not isinstance(step, dict):
+        return True
+    query = str(step.get("query", "") or "").strip()
+    if not query:
+        return False
+    if len(query) > 120:
+        return True
+    return bool(_SUSPICIOUS_QUERY_RE.search(query))
+
+
+def _has_reasoning_leak(payload: dict[str, Any]) -> bool:
+    chain = str(payload.get("causal_chain", "") or "").strip()
+    if not chain:
+        return False
+    return bool(_REASONING_LEAK_RE.search(chain))
+
+
+def _has_suspicious_answer(payload: dict[str, Any]) -> bool:
+    answer = str(payload.get("answer", "") or "").strip()
+    if not answer:
+        return True
+    if len(answer) > 40:
+        return True
+    if _payload_looks_arithmetic(payload) and not _is_numeric_answer(answer):
+        return True
+    return bool(_SUSPICIOUS_ANSWER_RE.search(answer) and not _is_numeric_answer(answer))
+
+
+def _has_suspicious_structure(payload: dict[str, Any]) -> bool:
+    steps = payload.get("steps", [])
+    facts = payload.get("facts", [])
+    causal_factors = payload.get("causal_factors", [])
+
+    if _has_suspicious_answer(payload):
+        return True
+    if any(_step_has_suspicious_query(step) for step in steps if isinstance(step, dict)):
+        return True
+    if _payload_looks_arithmetic(payload):
+        if not causal_factors:
+            return True
+        if not _facts_are_numeric(facts):
+            return True
+        if _count_answer_steps(steps) == 0:
+            return True
+    if _has_reasoning_leak(payload) and not causal_factors:
+        return True
+    return False
 
 
 def _merge_missing_fields(base: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -812,6 +927,12 @@ def score_causal_payload(candidate: dict[str, Any]) -> tuple[int, int, int]:
         score += 1
     elif ask_cloud_steps == 0 and not facts:
         score += 1
+    if _payload_looks_arithmetic(candidate) and _is_numeric_answer(answer):
+        score += 3
+    if _count_answer_steps(steps):
+        score += 2
+    if _has_suspicious_structure(candidate):
+        score -= 8
     return score, complete_steps, len(json.dumps(candidate, ensure_ascii=False))
 
 
@@ -826,6 +947,8 @@ def needs_causal_payload_repair(payload: dict[str, Any]) -> bool:
         return True
     ask_cloud_steps = _count_ask_cloud_steps(steps)
     if ask_cloud_steps != len(facts):
+        return True
+    if _has_suspicious_structure(payload):
         return True
     return False
 
