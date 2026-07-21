@@ -4,82 +4,95 @@ import json
 import re
 from typing import Any, Optional
 
-from ..knowledge_tokens import KNOWLEDGE_TOKEN
+from ..knowledge_tokens import KNOWLEDGE_TOKEN, normalize_knowledge_markers
 
 
-CAUSAL_TEACHER_SYSTEM_PROMPT = (
-    "You are a causal-reasoning teacher. For the given QUESTION, decompose the solution into an "
-    "explicit causal reasoning PATH. Separate stable cause->effect logic from spurious correlations "
-    "and specialized domain facts. Reply with a SINGLE JSON object and nothing else, using keys:\n"
-    '  "causal_factors": strings naming the variables that genuinely change the answer\n'
-    '  "confounders": strings naming background or lexical cues that correlate with the answer '
-    "but should not be treated as causes\n"
-    '  "steps": a list of objects, each with:\n'
-    '      "goal"  - what this step tries to establish\n'
-    '      "causal" - the transferable reasoning for this step. '
-    f"Where a concrete fact, number, or entity is required, write {KNOWLEDGE_TOKEN} instead.\n"
-    '      "needs_knowledge" - true if this step requires an external domain fact\n'
-    '      "action" - one of "LOCAL_REASON", "ASK_CLOUD", "ANSWER"\n'
-    '      "query" - if action is "ASK_CLOUD", the minimal knowledge question to ask the cloud\n'
-    f'  "facts": strings giving concrete knowledge for each {KNOWLEDGE_TOKEN} in step order\n'
-    '  "counterfactuals": a list of objects, each with "intervention", "expected_effect", '
-    '"answer", and optional "question"\n'
-    '  "answer": the final answer to the QUESTION\n'
-    'You may also include legacy key "causal_chain", but prefer "steps". '
-    "Do not output analysis, planning, or explanation outside the JSON object. "
-    "Do not wrap the JSON in markdown fences. Return only valid JSON.\n"
-    "Example JSON format:\n"
-    "{\n"
-    '  "causal_factors": ["factor A", "factor B"],\n'
-    '  "confounders": ["surface cue"],\n'
-    '  "steps": [\n'
-    '    {"goal": "identify the missing fact", "causal": "The answer depends on <knowledge>; once known, continue causal reasoning.", "needs_knowledge": true, "action": "ASK_CLOUD", "query": "What fact is needed?"},\n'
-    '    {"goal": "combine the fact with the question", "causal": "Use the fact to determine the answer.", "needs_knowledge": false, "action": "ANSWER", "query": ""}\n'
-    "  ],\n"
-    '  "facts": ["the needed fact"],\n'
-    '  "counterfactuals": [{"intervention": "change factor A", "expected_effect": "the answer changes", "answer": "new answer", "question": "What if factor A changed?"}],\n'
-    '  "answer": "final answer"\n'
-    "}"
-)
+_TOP_LEVEL_KEYS = ("causal_factors", "confounders", "steps", "facts", "counterfactuals", "answer")
+_STEP_KEYS = ("goal", "causal", "needs_knowledge", "action", "query")
+_COUNTERFACTUAL_KEYS = ("intervention", "expected_effect", "answer", "question")
+_ALLOWED_ACTIONS = {"LOCAL_REASON", "ASK_CLOUD", "ANSWER"}
 
-ARITHMETIC_CAUSAL_TEACHER_SYSTEM_PROMPT = (
-    "You are a teacher that converts arithmetic word problems into a strict causal-intervention JSON plan. "
-    "The QUESTION is a math or GSM8K-style reasoning problem. Reply with a SINGLE JSON object and nothing else.\n"
-    "Required keys:\n"
-    '  "causal_factors": strings naming the numeric quantities or variables that causally change the answer\n'
-    '  "confounders": strings naming irrelevant story details or lexical distractions\n'
-    '  "steps": a list of objects, each with:\n'
-    '      "goal"  - the sub-goal of this arithmetic step\n'
-    '      "causal" - abstract reasoning for the step. Replace every concrete intermediate number that will be computed '
-    f'with {KNOWLEDGE_TOKEN}.\n'
-    '      "needs_knowledge" - true when this step needs an intermediate numeric result that should be requested\n'
-    '      "action" - one of "LOCAL_REASON", "ASK_CLOUD", "ANSWER"\n'
-    '      "query" - for "ASK_CLOUD", ask for the exact intermediate computation, equation result, or unit conversion\n'
-    f'  "facts": strings containing the concrete intermediate numeric results for each {KNOWLEDGE_TOKEN}, in step order\n'
-    '  "counterfactuals": a list of objects, each with "intervention", "expected_effect", "answer", and optional "question"\n'
-    '  "answer": the final numeric answer only, as a short string\n'
-    "Rules:\n"
-    "1. For arithmetic problems, every intermediate numeric result needed by a later step should appear as an ASK_CLOUD step.\n"
-    "2. The number of facts must match the number of ASK_CLOUD observations in step order.\n"
-    "3. Do not include prose before or after the JSON object.\n"
-    "4. Do not wrap the JSON in markdown fences.\n"
-    "5. Do not output analysis, self-correction, or chain-of-thought outside the JSON object.\n"
-    "6. Use at least one ASK_CLOUD step whenever the problem requires multi-step arithmetic.\n"
-    "Return only valid JSON.\n"
-    "Example JSON format:\n"
-    "{\n"
-    '  "causal_factors": ["number of groups", "items per group"],\n'
-    '  "confounders": ["irrelevant story details"],\n'
-    '  "steps": [\n'
-    '    {"goal": "compute the first intermediate quantity", "causal": "Multiply the relevant quantities to obtain <knowledge>.", "needs_knowledge": true, "action": "ASK_CLOUD", "query": "What is the product of the relevant quantities?"},\n'
-    '    {"goal": "use the intermediate quantity to finish the problem", "causal": "Combine <knowledge> with the remaining quantities to reach the final answer.", "needs_knowledge": true, "action": "ASK_CLOUD", "query": "What is the final arithmetic result after combining the quantities?"},\n'
-    '    {"goal": "state the final result", "causal": "Return the computed result as the final answer.", "needs_knowledge": false, "action": "ANSWER", "query": ""}\n'
-    "  ],\n"
-    '  "facts": ["first computed value", "final computed value"],\n'
-    '  "counterfactuals": [{"intervention": "increase one quantity", "expected_effect": "the final answer increases", "answer": "updated numeric answer", "question": "What if one quantity were larger?"}],\n'
-    '  "answer": "42"\n'
-    "}"
-)
+
+def _build_json_skeleton(*, arithmetic: bool) -> str:
+    default_step = (
+        '{"goal": "compute an intermediate quantity", "causal": "Compute the needed quantity to obtain '
+        + KNOWLEDGE_TOKEN
+        + '.", "needs_knowledge": true, "action": "ASK_CLOUD", "query": "What is the needed intermediate value?"}'
+        if arithmetic
+        else '{"goal": "identify the next causal sub-goal", "causal": "Use the relevant cause-effect relation to move one step closer to the answer.", "needs_knowledge": false, "action": "LOCAL_REASON", "query": ""}'
+    )
+    counterfactual = (
+        '{"intervention": "change one causal factor", "expected_effect": "describe how the answer changes", '
+        '"answer": "updated answer", "question": "What if the causal factor changed?"}'
+    )
+    answer = '"42"' if arithmetic else '"final answer"'
+    facts = '["first computed value"]' if arithmetic else '["the needed external fact"]'
+    return (
+        "{\n"
+        '  "causal_factors": [],\n'
+        '  "confounders": [],\n'
+        f'  "steps": [{default_step}],\n'
+        f'  "facts": {facts},\n'
+        f'  "counterfactuals": [{counterfactual}],\n'
+        f'  "answer": {answer}\n'
+        "}"
+    )
+
+
+def _build_schema_contract(*, arithmetic: bool) -> str:
+    lines = [
+        "Schema contract:",
+        "1. Return a SINGLE JSON object and nothing else.",
+        f"2. The top-level object must contain exactly these keys and no others: {', '.join(_TOP_LEVEL_KEYS)}.",
+        f"3. Each item in steps must be an object with exactly these keys: {', '.join(_STEP_KEYS)}.",
+        f"4. Each item in counterfactuals must be an object with exactly these keys: {', '.join(_COUNTERFACTUAL_KEYS)}.",
+        f"5. In a step.causal string, replace any concrete missing fact or intermediate result with {KNOWLEDGE_TOKEN}.",
+        '6. Allowed action values are exactly "LOCAL_REASON", "ASK_CLOUD", and "ANSWER".',
+        '7. Use [] or "" instead of omitting a field.',
+        '8. If action is not "ASK_CLOUD", query must be "".',
+        '9. Do not add markdown fences, commentary, analysis, planning, or chain-of-thought outside the JSON object.',
+        '10. Do not put nested JSON in any string field and do not use the legacy top-level key "causal_chain".',
+    ]
+    if arithmetic:
+        lines.extend(
+            [
+                "11. For arithmetic or GSM8K problems, each intermediate numeric result needed later must appear as an ASK_CLOUD step.",
+                "12. The number of facts must match the number of ASK_CLOUD steps, in order.",
+                f"13. ASK_CLOUD queries must be concrete and self-contained; never place {KNOWLEDGE_TOKEN} inside query.",
+                "14. answer must be a short numeric string for the final result.",
+                "15. Use at least one ASK_CLOUD step when the problem needs multi-step arithmetic.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _build_teacher_system_prompt(*, arithmetic: bool) -> str:
+    role = (
+        "You are a teacher that converts arithmetic word problems into a strict causal-intervention JSON plan."
+        if arithmetic
+        else "You are a causal-reasoning teacher that converts a question into structured causal supervision."
+    )
+    return (
+        f"{role}\n"
+        f"{_build_schema_contract(arithmetic=arithmetic)}\n"
+        "Return only valid JSON.\n"
+        "Use this exact JSON shape:\n"
+        f"{_build_json_skeleton(arithmetic=arithmetic)}"
+    )
+
+
+def _build_repair_system_prompt(*, arithmetic: bool) -> str:
+    task = "arithmetic/GSM8K drafts" if arithmetic else "causal reasoning drafts"
+    return (
+        f"You are a strict JSON normalizer for {task}. Convert the provided DRAFT into a SINGLE valid JSON object and nothing else.\n"
+        f"{_build_schema_contract(arithmetic=arithmetic)}\n"
+        'Preserve only information supported by the draft. If the draft does not support a field, use [] or "".\n'
+        "Return only valid JSON."
+    )
+
+
+CAUSAL_TEACHER_SYSTEM_PROMPT = _build_teacher_system_prompt(arithmetic=False)
+ARITHMETIC_CAUSAL_TEACHER_SYSTEM_PROMPT = _build_teacher_system_prompt(arithmetic=True)
 
 KNOWLEDGE_FILL_SYSTEM_PROMPT = (
     "You are a cloud knowledge API invoked when an edge language model emits the special token "
@@ -88,25 +101,8 @@ KNOWLEDGE_FILL_SYSTEM_PROMPT = (
     "One or two concise sentences. No JSON."
 )
 
-CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = (
-    "You are a strict JSON normalizer. Convert the provided DRAFT into a SINGLE valid JSON object and nothing else. "
-    "Use exactly these keys: causal_factors, confounders, steps, facts, counterfactuals, answer.\n"
-    'Each step must be an object with keys: goal, causal, needs_knowledge, action, query.\n'
-    'Allowed action values: "LOCAL_REASON", "ASK_CLOUD", "ANSWER".\n'
-    "Preserve only information supported by the draft. If a field is missing, use [] or \"\". "
-    "Do not include markdown fences or explanations. Return only valid JSON."
-)
-
-ARITHMETIC_CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = (
-    "You are a strict JSON normalizer for arithmetic/GSM8K drafts. Convert the provided DRAFT into a SINGLE valid JSON object and nothing else.\n"
-    "Use exactly these keys: causal_factors, confounders, steps, facts, counterfactuals, answer.\n"
-    'Each step must be an object with keys: goal, causal, needs_knowledge, action, query.\n'
-    'Allowed action values: "LOCAL_REASON", "ASK_CLOUD", "ANSWER".\n'
-    f'In causal fields, keep {KNOWLEDGE_TOKEN} placeholders when the draft describes intermediate values abstractly.\n'
-    "Facts should contain concrete intermediate numeric results in step order. "
-    "If the draft does not support a field, use [] or \"\". "
-    "Do not include markdown fences or explanations. Return only valid JSON."
-)
+CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = _build_repair_system_prompt(arithmetic=False)
+ARITHMETIC_CAUSAL_JSON_REPAIR_SYSTEM_PROMPT = _build_repair_system_prompt(arithmetic=True)
 
 _ARITHMETIC_HINT_RE = re.compile(
     r"\b("
@@ -118,6 +114,7 @@ _ARITHMETIC_HINT_RE = re.compile(
 )
 _DIGIT_RE = re.compile(r"\d")
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", flags=re.DOTALL | re.IGNORECASE)
+_SCHEMA_ANCHOR_RE = re.compile(r'"(?:causal_factors|confounders|steps|facts|counterfactuals|answer)"')
 _NUMERIC_VALUE_RE = re.compile(r"(?<![\w/])-?\$?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?")
 _SECTION_LABEL_RE = re.compile(r"(?P<label>Causal factors|Confounders|Counterfactuals|Facts|Answer|Steps)\s*:")
 _SECTION_LABEL_LINE_RE = re.compile(
@@ -142,6 +139,13 @@ def _extract_json_block(text: str) -> Optional[str]:
 def _extract_balanced_json_block(text: str) -> Optional[str]:
     start = text.find("{")
     if start == -1:
+        return None
+
+    return _extract_balanced_json_block_from(text, start)
+
+
+def _extract_balanced_json_block_from(text: str, start: int) -> Optional[str]:
+    if start < 0 or start >= len(text) or text[start] != "{":
         return None
 
     depth = 0
@@ -223,6 +227,9 @@ def _extract_json_candidates(text: str) -> list[str]:
     _append(raw)
     for match in _JSON_FENCE_RE.finditer(raw):
         _append(match.group(1))
+    for match in _SCHEMA_ANCHOR_RE.finditer(raw):
+        brace_index = raw.rfind("{", 0, match.start())
+        _append(_extract_balanced_json_block_from(raw, brace_index))
     for candidate in reversed(_extract_all_balanced_json_blocks(raw)):
         _append(candidate)
     _append(_extract_balanced_json_block(raw))
@@ -243,35 +250,21 @@ def select_causal_teacher_system_prompt(question: str) -> str:
 
 def build_causal_teacher_user_prompt(question: str) -> str:
     stripped_question = (question or "").strip()
-    if looks_like_arithmetic_question(stripped_question):
+    arithmetic = looks_like_arithmetic_question(stripped_question)
+    if arithmetic:
         return (
             f"QUESTION:\n{stripped_question}\n\n"
-            "Return exactly one JSON object. The first character of your reply must be `{` and the last character must be `}`. "
-            "Do not add explanations outside the JSON. For each intermediate arithmetic result needed later, create an ASK_CLOUD step "
-            "and put the computed numeric result into facts in the same order.\n\n"
-            "Use this JSON skeleton:\n"
-            "{\n"
-            '  "causal_factors": [],\n'
-            '  "confounders": [],\n'
-            '  "steps": [{"goal": "", "causal": "", "needs_knowledge": true, "action": "ASK_CLOUD", "query": ""}],\n'
-            '  "facts": [],\n'
-            '  "counterfactuals": [{"intervention": "", "expected_effect": "", "answer": "", "question": ""}],\n'
-            '  "answer": ""\n'
-            "}"
+            "Return exactly one JSON object. The first character of your reply must be `{` and the last character must be `}`.\n"
+            f"{_build_schema_contract(arithmetic=True)}\n"
+            "Use this exact JSON skeleton:\n"
+            f"{_build_json_skeleton(arithmetic=True)}"
         )
     return (
         f"QUESTION:\n{stripped_question}\n\n"
-        "Return exactly one JSON object. The first character of your reply must be `{` and the last character must be `}`. "
-        "Do not add explanations outside the JSON.\n\n"
-        "Use this JSON skeleton:\n"
-        "{\n"
-        '  "causal_factors": [],\n'
-        '  "confounders": [],\n'
-        '  "steps": [{"goal": "", "causal": "", "needs_knowledge": false, "action": "LOCAL_REASON", "query": ""}],\n'
-        '  "facts": [],\n'
-        '  "counterfactuals": [{"intervention": "", "expected_effect": "", "answer": "", "question": ""}],\n'
-        '  "answer": ""\n'
-        "}"
+        "Return exactly one JSON object. The first character of your reply must be `{` and the last character must be `}`.\n"
+        f"{_build_schema_contract(arithmetic=False)}\n"
+        "Use this exact JSON skeleton:\n"
+        f"{_build_json_skeleton(arithmetic=False)}"
     )
 
 
@@ -280,13 +273,34 @@ def select_causal_repair_system_prompt(question: str) -> str:
 
 
 def build_causal_repair_user_prompt(question: str, draft_response: str) -> str:
+    arithmetic = looks_like_arithmetic_question(question)
     return (
         f"QUESTION:\n{(question or '').strip()}\n\n"
         "DRAFT RESPONSE TO NORMALIZE:\n"
         f"{(draft_response or '').strip()}\n\n"
-        "Convert the draft into exactly one valid JSON object with keys "
-        "causal_factors, confounders, steps, facts, counterfactuals, answer."
+        "Convert the draft into exactly one valid JSON object.\n"
+        f"{_build_schema_contract(arithmetic=arithmetic)}\n"
+        "Use this exact JSON skeleton:\n"
+        f"{_build_json_skeleton(arithmetic=arithmetic)}"
     )
+
+
+def _normalize_inline_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().strip("\"'")
+
+
+def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "0", "false", "no", "n", "none", "null"}:
+            return False
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+    return default
 
 
 def _coerce_str_list(value: Any) -> list[str]:
@@ -294,20 +308,29 @@ def _coerce_str_list(value: Any) -> list[str]:
         value = [value]
     if not isinstance(value, list):
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    items: list[str] = []
+    for item in value:
+        normalized = _normalize_inline_text(item)
+        if normalized:
+            items.append(normalized)
+    return items
 
 
 def _coerce_counterfactuals(value: Any) -> list[dict[str, str]]:
+    if isinstance(value, dict):
+        value = [value]
     if not isinstance(value, list):
         return []
 
     counterfactuals: list[dict[str, str]] = []
     for item in value:
         if isinstance(item, dict):
-            intervention = str(item.get("intervention", "")).strip()
-            expected_effect = str(item.get("expected_effect", "") or item.get("expected_change", "")).strip()
-            answer = str(item.get("answer", "") or item.get("counterfactual_answer", "")).strip()
-            question = str(item.get("question", "") or item.get("counterfactual_question", "")).strip()
+            intervention = _normalize_inline_text(item.get("intervention", ""))
+            expected_effect = _normalize_inline_text(item.get("expected_effect", "") or item.get("expected_change", ""))
+            answer = _clean_answer_candidate(
+                str(item.get("answer", "") or item.get("counterfactual_answer", "") or "")
+            )
+            question = _normalize_inline_text(item.get("question", "") or item.get("counterfactual_question", ""))
             if intervention or expected_effect or answer or question:
                 counterfactuals.append(
                     {
@@ -320,7 +343,7 @@ def _coerce_counterfactuals(value: Any) -> list[dict[str, str]]:
         elif isinstance(item, str) and item.strip():
             counterfactuals.append(
                 {
-                    "intervention": item.strip(),
+                    "intervention": _normalize_inline_text(item),
                     "expected_effect": "",
                     "answer": "",
                     "question": "",
@@ -329,18 +352,44 @@ def _coerce_counterfactuals(value: Any) -> list[dict[str, str]]:
     return counterfactuals
 
 
-def _coerce_step(step: dict[str, Any]) -> dict[str, Any]:
-    action = str(step.get("action", "") or "").strip().upper()
-    if action not in {"LOCAL_REASON", "ASK_CLOUD", "ANSWER"}:
-        action = "ASK_CLOUD" if step.get("needs_knowledge", False) else "LOCAL_REASON"
+def _normalize_action(raw_action: Any, *, needs_knowledge: bool, causal: str, query: str) -> str:
+    action = _normalize_inline_text(raw_action).upper()
+    if action in _ALLOWED_ACTIONS:
+        return action
+    if query or needs_knowledge or KNOWLEDGE_TOKEN in causal:
+        return "ASK_CLOUD"
+    if not causal:
+        return "ANSWER"
+    return "LOCAL_REASON"
 
-    causal = str(step.get("causal", "") or step.get("reasoning", "") or "").strip()
+
+def _coerce_step(step: Any) -> dict[str, Any]:
+    if isinstance(step, str):
+        step = {"causal": step}
+    elif not isinstance(step, dict):
+        step = {}
+
+    goal = _normalize_inline_text(step.get("goal", "") or step.get("action_goal", ""))
+    causal = normalize_knowledge_markers(_normalize_inline_text(step.get("causal", "") or step.get("reasoning", "")))
+    query = _normalize_inline_text(step.get("query", "") or step.get("knowledge_query", ""))
+    needs_knowledge = _coerce_bool(
+        step.get("needs_knowledge", step.get("need_knowledge", None)),
+        default=bool(query) or KNOWLEDGE_TOKEN in causal,
+    )
+    action = _normalize_action(step.get("action", ""), needs_knowledge=needs_knowledge, causal=causal, query=query)
+    if action == "ASK_CLOUD":
+        needs_knowledge = True
+    else:
+        query = ""
+        if action == "ANSWER":
+            needs_knowledge = False
+
     return {
-        "goal": str(step.get("goal", "") or step.get("action_goal", "") or "").strip(),
+        "goal": goal,
         "causal": causal,
-        "needs_knowledge": bool(step.get("needs_knowledge", action == "ASK_CLOUD" or KNOWLEDGE_TOKEN in causal)),
+        "needs_knowledge": needs_knowledge,
         "action": action,
-        "query": str(step.get("query", "") or step.get("knowledge_query", "") or "").strip(),
+        "query": query,
     }
 
 
@@ -426,13 +475,15 @@ def _parse_section_steps(text: str) -> list[dict[str, Any]]:
         if not match:
             continue
         steps.append(
-            {
-                "goal": match.group("goal").strip(),
-                "causal": match.group("causal").strip(),
-                "needs_knowledge": match.group("needs").strip().lower() == "true",
-                "action": match.group("action").strip().upper(),
-                "query": match.group("query").strip(),
-            }
+            _coerce_step(
+                {
+                    "goal": match.group("goal").strip(),
+                    "causal": match.group("causal").strip(),
+                    "needs_knowledge": match.group("needs").strip().lower() == "true",
+                    "action": match.group("action").strip().upper(),
+                    "query": match.group("query").strip(),
+                }
+            )
         )
     return steps
 
@@ -540,17 +591,212 @@ def _recover_arithmetic_fields(text: str) -> dict[str, Any]:
     return {"steps": steps, "facts": facts, "answer": answer}
 
 
-def score_causal_payload(candidate: dict[str, Any]) -> tuple[int, int]:
-    steps = candidate.get("steps")
-    facts = candidate.get("facts")
-    counterfactuals = candidate.get("counterfactuals")
-    causal_factors = candidate.get("causal_factors")
-    confounders = candidate.get("confounders")
+def _empty_payload(causal_chain: str = "") -> dict[str, Any]:
+    return {
+        "causal_chain": causal_chain,
+        "steps": [],
+        "facts": [],
+        "causal_factors": [],
+        "confounders": [],
+        "counterfactuals": [],
+        "answer": "",
+    }
+
+
+def _coerce_facts(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    facts: list[str] = []
+    for item in value:
+        normalized = _normalize_inline_text(item)
+        if normalized:
+            facts.append(normalized)
+    return facts
+
+
+def _coerce_steps(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+
+    steps: list[dict[str, Any]] = []
+    for item in value:
+        step = _coerce_step(item)
+        if step["goal"] or step["causal"] or step["query"] or step["action"] == "ANSWER":
+            steps.append(step)
+    return steps
+
+
+def _coerce_causal_chain(value: Any) -> str:
+    if isinstance(value, list):
+        return "\n".join(_normalize_inline_text(item) for item in value if _normalize_inline_text(item))
+    return _normalize_inline_text(value)
+
+
+def _count_ask_cloud_steps(steps: Any) -> int:
+    if not isinstance(steps, list):
+        return 0
+    return sum(1 for step in steps if isinstance(step, dict) and str(step.get("action", "")).upper() == "ASK_CLOUD")
+
+
+def _step_is_complete(step: Any) -> bool:
+    if not isinstance(step, dict):
+        return False
+    action = str(step.get("action", "")).strip().upper()
+    if action not in _ALLOWED_ACTIONS:
+        return False
+    if action == "ASK_CLOUD":
+        return bool(step.get("causal")) and bool(step.get("query"))
+    if action == "ANSWER":
+        return bool(step.get("goal") or step.get("causal"))
+    return bool(step.get("causal"))
+
+
+def _merge_missing_fields(base: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    merged = {
+        "causal_chain": base.get("causal_chain", ""),
+        "steps": list(base.get("steps", [])),
+        "facts": list(base.get("facts", [])),
+        "causal_factors": list(base.get("causal_factors", [])),
+        "confounders": list(base.get("confounders", [])),
+        "counterfactuals": list(base.get("counterfactuals", [])),
+        "answer": str(base.get("answer", "") or ""),
+    }
+    if candidate.get("steps") and not merged["steps"]:
+        merged["steps"] = list(candidate["steps"])
+    if candidate.get("facts") and not merged["facts"]:
+        merged["facts"] = list(candidate["facts"])
+    if candidate.get("causal_factors") and not merged["causal_factors"]:
+        merged["causal_factors"] = list(candidate["causal_factors"])
+    if candidate.get("confounders") and not merged["confounders"]:
+        merged["confounders"] = list(candidate["confounders"])
+    if candidate.get("counterfactuals") and not merged["counterfactuals"]:
+        merged["counterfactuals"] = list(candidate["counterfactuals"])
+    if candidate.get("answer") and not merged["answer"]:
+        merged["answer"] = str(candidate["answer"]).strip()
+    if candidate.get("causal_chain") and not merged["causal_chain"]:
+        merged["causal_chain"] = str(candidate["causal_chain"]).strip()
+    return merged
+
+
+def _iter_json_dicts(text: str) -> list[dict[str, Any]]:
+    dictionaries: list[dict[str, Any]] = []
+    for candidate in _extract_json_candidates(text or ""):
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            dictionaries.append(parsed)
+    return dictionaries
+
+
+def _iter_payload_dict_candidates(payload: dict[str, Any], *, allow_nested: bool) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    queue: list[dict[str, Any]] = [payload]
+
+    while queue:
+        current = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        candidates.append(current)
+
+        for key in ("payload", "result", "response", "data", "output"):
+            nested = current.get(key)
+            if isinstance(nested, dict):
+                queue.append(nested)
+            elif allow_nested and isinstance(nested, str) and "{" in nested:
+                queue.extend(_iter_json_dicts(nested))
+
+    return candidates
+
+
+def _normalize_payload_dict(payload: dict[str, Any], *, raw_text: str, allow_nested: bool) -> dict[str, Any]:
+    result = _empty_payload()
+    result["causal_chain"] = _coerce_causal_chain(payload.get("causal_chain", "") or payload.get("reasoning", ""))
+    result["steps"] = _coerce_steps(payload.get("steps", payload.get("causal_steps", payload.get("reasoning_steps", []))))
+    result["facts"] = _coerce_facts(payload.get("facts", payload.get("knowledge", payload.get("observations", []))))
+    result["causal_factors"] = _coerce_str_list(payload.get("causal_factors", payload.get("factors", [])))
+    result["confounders"] = _coerce_str_list(payload.get("confounders", payload.get("spurious_correlations", [])))
+    result["counterfactuals"] = _coerce_counterfactuals(
+        payload.get("counterfactuals", payload.get("counterfactual_tests", []))
+    )
+    result["answer"] = _clean_answer_candidate(str(payload.get("answer", "") or payload.get("final_answer", "") or ""))
+    if not result["answer"]:
+        result["answer"] = _extract_answer_from_text(result["causal_chain"] or raw_text)
+
+    if allow_nested:
+        for key in ("causal_chain", "payload", "result", "response", "data", "output"):
+            nested_text = payload.get(key)
+            if not isinstance(nested_text, str) or "{" not in nested_text:
+                continue
+            nested_payload = parse_causal_payload(nested_text, _allow_nested=False)
+            if score_causal_payload(nested_payload) > score_causal_payload(result):
+                merged = _merge_missing_fields(nested_payload, result)
+                if not merged.get("causal_chain"):
+                    merged["causal_chain"] = result["causal_chain"]
+                result = merged
+            else:
+                result = _merge_missing_fields(result, nested_payload)
+
+    for source_text in (result["causal_chain"], raw_text):
+        if not isinstance(source_text, str) or not source_text.strip():
+            continue
+        recovered = _recover_structured_fields(source_text)
+        result = _merge_missing_fields(
+            result,
+            {
+                "causal_chain": "",
+                "steps": recovered.get("steps", []),
+                "facts": recovered.get("facts", []),
+                "causal_factors": recovered.get("causal_factors", []),
+                "confounders": recovered.get("confounders", []),
+                "counterfactuals": recovered.get("counterfactuals", []),
+                "answer": _extract_answer_from_text(source_text),
+            },
+        )
+        arithmetic_recovered = _recover_arithmetic_fields(source_text)
+        result = _merge_missing_fields(
+            result,
+            {
+                "causal_chain": "",
+                "steps": arithmetic_recovered.get("steps", []),
+                "facts": arithmetic_recovered.get("facts", []),
+                "causal_factors": [],
+                "confounders": [],
+                "counterfactuals": [],
+                "answer": arithmetic_recovered.get("answer", ""),
+            },
+        )
+
+    if not result["causal_chain"] and result["steps"]:
+        result["causal_chain"] = "\n".join(step["causal"] for step in result["steps"] if step.get("causal"))
+    return result
+
+
+def score_causal_payload(candidate: dict[str, Any]) -> tuple[int, int, int]:
+    steps = candidate.get("steps", [])
+    facts = candidate.get("facts", [])
+    counterfactuals = candidate.get("counterfactuals", [])
+    causal_factors = candidate.get("causal_factors", [])
+    confounders = candidate.get("confounders", [])
     answer = str(candidate.get("answer", "") or "").strip()
 
+    complete_steps = sum(1 for step in steps if _step_is_complete(step))
+    ask_cloud_steps = _count_ask_cloud_steps(steps)
     score = 0
     if isinstance(steps, list) and steps:
-        score += 5
+        score += 8
+    if answer:
+        score += 6
     if isinstance(facts, list) and facts:
         score += 4
     if isinstance(counterfactuals, list) and counterfactuals:
@@ -559,27 +805,38 @@ def score_causal_payload(candidate: dict[str, Any]) -> tuple[int, int]:
         score += 2
     if isinstance(confounders, list) and confounders:
         score += 1
-    if answer:
-        score += 2
-    return score, len(json.dumps(candidate, ensure_ascii=False))
+    score += complete_steps
+    if ask_cloud_steps == len(facts):
+        score += 4
+    elif ask_cloud_steps and facts:
+        score += 1
+    elif ask_cloud_steps == 0 and not facts:
+        score += 1
+    return score, complete_steps, len(json.dumps(candidate, ensure_ascii=False))
 
 
 def needs_causal_payload_repair(payload: dict[str, Any]) -> bool:
+    steps = payload.get("steps", [])
+    facts = payload.get("facts", [])
     if not str(payload.get("answer", "") or "").strip():
         return True
-    if not payload.get("steps"):
+    if not isinstance(steps, list) or not steps:
         return True
-    if not payload.get("facts"):
+    if any(not _step_is_complete(step) for step in steps):
+        return True
+    ask_cloud_steps = _count_ask_cloud_steps(steps)
+    if ask_cloud_steps != len(facts):
         return True
     return False
 
 
 def parse_causal_payload(text: str, *, _allow_nested: bool = True) -> dict[str, Any]:
-    raw = text.strip()
-    payload: Optional[dict[str, Any]] = None
+    raw = (text or "").strip()
+    if not raw:
+        return _empty_payload()
 
     best_payload: Optional[dict[str, Any]] = None
-    best_score: Optional[tuple[int, int]] = None
+    best_score: Optional[tuple[int, int, int]] = None
 
     for candidate in _extract_json_candidates(raw):
         if not candidate:
@@ -588,103 +845,45 @@ def parse_causal_payload(text: str, *, _allow_nested: bool = True) -> dict[str, 
             parsed = json.loads(candidate)
         except (json.JSONDecodeError, TypeError):
             continue
-        if isinstance(parsed, dict):
-            score = score_causal_payload(parsed)
-            if best_payload is None or score > best_score:
-                best_payload = parsed
+        if not isinstance(parsed, dict):
+            continue
+
+        for payload_candidate in _iter_payload_dict_candidates(parsed, allow_nested=_allow_nested):
+            normalized = _normalize_payload_dict(payload_candidate, raw_text=raw, allow_nested=_allow_nested)
+            score = score_causal_payload(normalized)
+            if best_payload is None or best_score is None or score > best_score:
+                best_payload = normalized
                 best_score = score
 
-    payload = best_payload
+    if best_payload is not None:
+        return best_payload
 
-    if payload is None:
-        result = {
-            "causal_chain": raw,
-            "steps": [],
-            "facts": [],
+    fallback = _empty_payload(raw)
+    fallback["answer"] = _extract_answer_from_text(raw)
+    recovered = _recover_structured_fields(raw)
+    fallback = _merge_missing_fields(
+        fallback,
+        {
+            "causal_chain": "",
+            "steps": recovered.get("steps", []),
+            "facts": recovered.get("facts", []),
+            "causal_factors": recovered.get("causal_factors", []),
+            "confounders": recovered.get("confounders", []),
+            "counterfactuals": recovered.get("counterfactuals", []),
+            "answer": "",
+        },
+    )
+    arithmetic_recovered = _recover_arithmetic_fields(raw)
+    fallback = _merge_missing_fields(
+        fallback,
+        {
+            "causal_chain": "",
+            "steps": arithmetic_recovered.get("steps", []),
+            "facts": arithmetic_recovered.get("facts", []),
             "causal_factors": [],
             "confounders": [],
             "counterfactuals": [],
-            "answer": _extract_answer_from_text(raw),
-        }
-        recovered = _recover_structured_fields(raw)
-        for key in ("steps", "facts", "causal_factors", "confounders", "counterfactuals"):
-            if recovered.get(key):
-                result[key] = recovered[key]
-        arithmetic_recovered = _recover_arithmetic_fields(raw)
-        for key in ("steps", "facts"):
-            if arithmetic_recovered.get(key) and not result.get(key):
-                result[key] = arithmetic_recovered[key]
-        if arithmetic_recovered.get("answer") and not result["answer"]:
-            result["answer"] = arithmetic_recovered["answer"]
-        return result
-
-    raw_chain = payload.get("causal_chain", "")
-    if isinstance(raw_chain, list):
-        causal_chain = "\n".join(str(step).strip() for step in raw_chain if str(step).strip())
-    else:
-        causal_chain = str(raw_chain or "").strip()
-
-    facts = payload.get("facts", []) or []
-    if isinstance(facts, str):
-        facts = [facts]
-    facts = [str(fact).strip() for fact in facts if str(fact).strip()]
-
-    steps = payload.get("steps")
-    if isinstance(steps, list):
-        normalized_steps = []
-        for step in steps:
-            if isinstance(step, dict):
-                normalized_steps.append(_coerce_step(step))
-            elif isinstance(step, str) and step.strip():
-                normalized_steps.append(
-                    {
-                        "goal": "",
-                        "causal": step.strip(),
-                        "needs_knowledge": KNOWLEDGE_TOKEN in step,
-                        "action": "ASK_CLOUD" if KNOWLEDGE_TOKEN in step else "LOCAL_REASON",
-                        "query": "",
-                    }
-                )
-    else:
-        normalized_steps = []
-
-    result = {
-        "causal_chain": causal_chain,
-        "steps": normalized_steps,
-        "facts": facts,
-        "causal_factors": _coerce_str_list(payload.get("causal_factors", [])),
-        "confounders": _coerce_str_list(payload.get("confounders", [])),
-        "counterfactuals": _coerce_counterfactuals(payload.get("counterfactuals", [])),
-        "answer": str(payload.get("answer", "")).strip() or _extract_answer_from_text(raw),
-    }
-
-    if _allow_nested and isinstance(causal_chain, str) and "{" in causal_chain:
-        nested = parse_causal_payload(causal_chain, _allow_nested=False)
-        if nested.get("steps") and not result["steps"]:
-            result["steps"] = nested["steps"]
-        if nested.get("facts") and not result["facts"]:
-            result["facts"] = nested["facts"]
-        if nested.get("causal_factors") and not result["causal_factors"]:
-            result["causal_factors"] = nested["causal_factors"]
-        if nested.get("confounders") and not result["confounders"]:
-            result["confounders"] = nested["confounders"]
-        if nested.get("counterfactuals") and not result["counterfactuals"]:
-            result["counterfactuals"] = nested["counterfactuals"]
-        if nested.get("answer") and not result["answer"]:
-            result["answer"] = nested["answer"]
-
-    for source_text in (causal_chain, raw):
-        if not isinstance(source_text, str) or not source_text.strip():
-            continue
-        recovered = _recover_structured_fields(source_text)
-        for key in ("steps", "facts", "causal_factors", "confounders", "counterfactuals"):
-            if recovered.get(key) and not result.get(key):
-                result[key] = recovered[key]
-        arithmetic_recovered = _recover_arithmetic_fields(source_text)
-        for key in ("steps", "facts"):
-            if arithmetic_recovered.get(key) and not result.get(key):
-                result[key] = arithmetic_recovered[key]
-        if arithmetic_recovered.get("answer") and not result["answer"]:
-            result["answer"] = arithmetic_recovered["answer"]
-
-    return result
+            "answer": arithmetic_recovered.get("answer", ""),
+        },
+    )
+    return fallback

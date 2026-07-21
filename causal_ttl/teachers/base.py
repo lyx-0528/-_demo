@@ -39,6 +39,8 @@ class BaseTeacher(ABC):
         repaired_response = self.generate(repair_prompt, system_prompt=repair_system_prompt)
         repaired_payload = parse_causal_payload(repaired_response)
 
+        if not needs_causal_payload_repair(repaired_payload):
+            return repaired_payload
         if score_causal_payload(repaired_payload) > score_causal_payload(payload):
             return repaired_payload
         return payload
