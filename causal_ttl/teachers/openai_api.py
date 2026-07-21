@@ -10,6 +10,9 @@ from .base import BaseTeacher
 from .cache import TeacherCache
 
 
+_RESPONSE_EXTRACTION_VERSION = "content_only_v1"
+
+
 class OpenAICompatibleTeacher(BaseTeacher):
     def __init__(
         self,
@@ -39,6 +42,7 @@ class OpenAICompatibleTeacher(BaseTeacher):
             "max_new_tokens": self.max_new_tokens,
             "system_prompt": system_prompt,
             "prompt": prompt,
+            "response_extraction_version": _RESPONSE_EXTRACTION_VERSION,
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -81,6 +85,36 @@ class OpenAICompatibleTeacher(BaseTeacher):
                         return candidate
         return None
 
+    @staticmethod
+    def _coerce_message_text(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if not isinstance(value, list):
+            return ""
+
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content:
+                parts.append(content)
+        return "".join(parts)
+
+    @staticmethod
+    def _preview_text(text: str, limit: int = 200) -> str:
+        normalized = " ".join((text or "").split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 3] + "..."
+
     def _request(self, prompt: str, system_prompt: Optional[str]) -> str:
         url = f"{self.api_base}/chat/completions"
         messages = []
@@ -112,7 +146,7 @@ class OpenAICompatibleTeacher(BaseTeacher):
             raise RuntimeError("Teacher API returned no choices.")
 
         message = choices[0].get("message") or {}
-        content = message.get("content") if isinstance(message.get("content"), str) else ""
+        content = self._coerce_message_text(message.get("content"))
         reasoning = message.get("reasoning_content") if isinstance(message.get("reasoning_content"), str) else ""
         expects_json = bool(system_prompt and "Return only valid JSON" in system_prompt)
 
@@ -121,23 +155,21 @@ class OpenAICompatibleTeacher(BaseTeacher):
             if content_json:
                 return content_json
 
-            reasoning_json = self._extract_complete_json_object(reasoning)
-            if reasoning_json:
-                return reasoning_json
-
-            if content.strip():
-                return content.strip()
-            if reasoning.strip():
-                return reasoning.strip()
+            raise RuntimeError(
+                "Teacher API JSON mode response did not contain a valid JSON object in message.content. "
+                f"content_preview={self._preview_text(content)!r}; "
+                f"reasoning_preview={self._preview_text(reasoning)!r}. "
+                "reasoning_content is ignored for teacher outputs."
+            )
 
         text = content.strip()
-        if not text and reasoning.strip():
-            text = reasoning.strip()
-        elif reasoning.strip() and reasoning.strip() not in text:
-            text = f"{text}\n{reasoning.strip()}".strip()
-        if not text:
-            raise RuntimeError("Teacher API returned an empty response.")
-        return text
+        if text:
+            return text
+        raise RuntimeError(
+            "Teacher API returned an empty message.content. "
+            f"reasoning_preview={self._preview_text(reasoning)!r}. "
+            "reasoning_content is ignored for teacher outputs."
+        )
 
     def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         key = self._cache_key(prompt, system_prompt)
